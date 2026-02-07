@@ -607,7 +607,6 @@ with tabs[0]:
     if up is not None:
         try:
             xbytes = up.getvalue()
-            st.session_state.pop("fullfile_day_range", None)
             S["last_uploaded_bytes"] = xbytes
 
             std_ts, cus_ts, inv_ts, fin_ts = make_timeseries_from_excel(xbytes)
@@ -736,9 +735,6 @@ with tabs[2]:
 # --------------------
 # Tab 3: Full-file analysis + Price Suggest
 # --------------------
-# --------------------
-# Tab 3: Full-file analysis + Price Suggest
-# --------------------
 with tabs[3]:
     st.subheader("Full-file Analysis + Suggest Standard Product Price")
 
@@ -747,51 +743,29 @@ with tabs[3]:
     else:
         std_ts, cus_ts, inv_ts, fin_ts = make_timeseries_from_excel(S["last_uploaded_bytes"])
 
+        # --- Build dataset and suggest price ---
         if std_ts is None or std_ts.empty:
             st.warning("ไม่เจอชีท Standard หรือข้อมูลว่าง")
         else:
-            # --- Build dataset and suggest price ---
             std_price_df = build_standard_price_dataset(std_ts)
 
-            if std_price_df.empty:
-                st.warning(
-                    "ไม่มีข้อมูล Standard Price/Demand ที่ใช้ทำ Full-file analysis "
-                    "(Price หรือ DemandProxy อาจเป็น 0 ทั้งหมด)"
-                )
-                st.stop()
+            # Range filter
+            min_d = int(std_price_df["Day"].min()) if not std_price_df.empty else 0
+            max_d = int(std_price_df["Day"].max()) if not std_price_df.empty else 0
+            r = st.slider("เลือกช่วงวันสำหรับ Full-file analysis", min_d, max_d, (min_d, max_d))
 
-            min_d = int(std_price_df["Day"].min())
-            max_d = int(std_price_df["Day"].max())
-
-            if min_d == max_d:
-                st.info(f"ไฟล์มีข้อมูล Standard ที่ใช้ได้แค่วันเดียว: Day {min_d}")
-                r0, r1 = min_d, max_d
-            else:
-                r0, r1 = st.slider(
-                    "เลือกช่วงวันสำหรับ Full-file analysis",
-                    min_value=min_d,
-                    max_value=max_d,
-                    value=(min_d, max_d),
-                    step=1,
-                    key="fullfile_day_range",
-                )
-
-            dfR = std_price_df[(std_price_df["Day"] >= r0) & (std_price_df["Day"] <= r1)].copy()
+            dfR = std_price_df[(std_price_df["Day"] >= r[0]) & (std_price_df["Day"] <= r[1])].copy()
 
             sugg = suggest_standard_price(dfR)
 
             st.markdown("### ✅ Suggested Standard Product Price")
-            method_name = (
-                "Fitted demand curve (Price↔Demand)"
-                if sugg.get("method", 0) == 1.0
-                else "Fallback rule (Market + Backlog/Fill)"
-            )
-
+            method_name = "Fitted demand curve (Price↔Demand)" if sugg.get("method", 0) == 1.0 else "Fallback rule (Market + Backlog/Fill)"
             st.info(
                 f"Suggested Price: **{money(sugg.get('suggested_price', 0.0))}**  | "
                 f"Method: {method_name}  | "
                 f"R²: {num(sugg.get('r2', 0.0))}"
             )
+
             st.json(sugg)
 
             # --- Show key diagnostics across file ---
@@ -806,21 +780,23 @@ with tabs[3]:
             c3.metric("Price unique values", str(int(price_var)))
             c4.metric("Days in range", str(int(len(dfR))))
 
-            st.markdown("### 📈 Standard — Price vs DemandProxy (Scatter-ish)")
+            st.markdown("### 📈 Standard — Price vs DemandProxy (Scatter)")
+            # show as table + simple line charts (streamlit native line_chart has no scatter)
+            # We'll approximate scatter by showing a sorted-by-price line
             sc = dfR.sort_values("Price")[["Price", "DemandProxy"]].reset_index(drop=True)
-            st.caption("หมายเหตุ: เรียงตามราคาเพื่อดูแนวโน้ม Demand ลด/เพิ่มตามราคา")
+            st.caption("หมายเหตุ: เป็นการเรียงตามราคาเพื่อดูแนวโน้ม Demand ลด/เพิ่มตามราคา")
             st.line_chart(sc.set_index("Price")[["DemandProxy"]], height=220)
 
             st.markdown("### 🧱 Standard — Backlog & Fill Rate Over Time")
             st.line_chart(dfR.set_index("Day")[["BacklogProxy", "FillRateProxy"]], height=220)
 
             st.markdown("### 🔍 ช่วงที่ “พัง” (Top 10 days)")
+            # Define "badness" = backlog + (1-fill)*demand
             bad = dfR.copy()
             bad["BadScore"] = bad["BacklogProxy"] + (1.0 - bad["FillRateProxy"]).clip(lower=0.0) * bad["DemandProxy"]
-
             st.dataframe(
                 bad.sort_values("BadScore", ascending=False)[
                     ["Day", "Price", "Market", "DemandProxy", "Deliveries", "BacklogProxy", "FillRateProxy", "BadScore"]
                 ].head(10),
-                use_container_width=True,
+                use_container_width=True
             )
