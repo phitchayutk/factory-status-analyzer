@@ -1,14 +1,16 @@
 # ============================================================
 # Factory Status Analyzer (Game Excel Export) — CLEAN COPY-PASTE ✅
 # ✅ Robust import (alias columns, pick best day)
-# ✅ Fix: COL dict, dataclass duplicates, upload bytes stored
+# ✅ Fix: bytes->ExcelFile (BytesIO), safe day parsing
 # ✅ Add: Standard Product Price + Market Price + Deliveries
-# ✅ Add: Dashboard Trend Graphs (Finance / Inventory / Lines)
+# ✅ Add: Dashboard Trend Graphs + Graph Titles
+# ✅ FIX: Per-user session isolation (เพื่อนเข้าลิงก์เดียวกันจะไม่เห็นค่ากัน)
 # ✅ ROQ/ROP: ROQ = EOQ (no safety), ROP = D*LeadTime (no safety)
 # ============================================================
 
 import io
 import math
+import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -83,15 +85,22 @@ def getv(row: pd.Series, df: pd.DataFrame, aliases: List[str], default=0.0) -> f
 
 
 def excel_file_from_bytes(xbytes: bytes) -> pd.ExcelFile:
-    """Always safe for pandas: wrap bytes as BytesIO."""
+    """
+    Always safe for pandas: wrap bytes as BytesIO.
+
+    IMPORTANT:
+    - Reading .xlsx requires 'openpyxl' installed on Streamlit Cloud.
+      If you see ImportError about openpyxl, add it to requirements.txt:
+        openpyxl
+    """
     return pd.ExcelFile(io.BytesIO(xbytes))
 
 
-def safe_day_series(df: Optional[pd.DataFrame]) -> pd.Series:
+def safe_day_series(df: Optional[pd.DataFrame], day_aliases: List[str]) -> pd.Series:
     """Return clean int day series from df or empty."""
     if df is None:
         return pd.Series([], dtype=int)
-    dcol = pick_col(df, COL["DAY"])
+    dcol = pick_col(df, day_aliases)
     if not dcol:
         return pd.Series([], dtype=int)
     vals = pd.to_numeric(df[dcol], errors="coerce").dropna()
@@ -296,12 +305,45 @@ CHEAT_DEFAULTS = {
 
 
 # ============================================================
+# ✅ Per-user session isolation
+# ============================================================
+def get_sid() -> str:
+    if "sid" not in st.session_state:
+        st.session_state.sid = str(uuid.uuid4())
+    return st.session_state.sid
+
+
+SID = get_sid()
+
+if "sessions" not in st.session_state:
+    st.session_state.sessions = {}
+
+if SID not in st.session_state.sessions:
+    st.session_state.sessions[SID] = {
+        "inventory": InventoryInputs(),
+        "financial": FinancialInputs(),
+        "workforce": WorkforceInputs(),
+        "standard": StandardLineInputs(),
+        "custom": CustomLineInputs(),
+        "machine_prices": MachinePrices(),
+        "import_day": None,
+        "last_uploaded_bytes": None,
+    }
+
+S = st.session_state.sessions[SID]  # state ของ "คนนี้" เท่านั้น
+
+
+# ============================================================
 # Import utilities
 # ============================================================
 def pick_best_day(std_df, cus_df, fin_df) -> int:
     """Pick latest day that has real activity."""
     all_days = pd.concat(
-        [safe_day_series(std_df), safe_day_series(cus_df), safe_day_series(fin_df)],
+        [
+            safe_day_series(std_df, COL["DAY"]),
+            safe_day_series(cus_df, COL["DAY"]),
+            safe_day_series(fin_df, COL["DAY"]),
+        ],
         ignore_index=True,
     )
     if all_days.empty:
@@ -476,10 +518,10 @@ def recommend_reorder_policy(inv: InventoryInputs, std: StandardLineInputs, cus:
     D = std_parts + cus_parts  # parts/day
 
     h = 1.0  # holding cost per part/day (game)
-    S = inv.order_fee
+    Sfee = inv.order_fee
 
     rop = D * inv.lead_time_days
-    roq = math.sqrt((2.0 * D * S) / h) if D > 0 else 0.0
+    roq = math.sqrt((2.0 * D * Sfee) / h) if D > 0 else 0.0
 
     return {
         "parts_per_day": D,
@@ -750,77 +792,80 @@ st.title("🏭 Factory Status Analyzer")
 
 tabs = st.tabs(["0) Import Excel", "1) Input", "2) Dashboard", "3) Checklist + Recommendations"])
 
-# session state defaults
-if "inventory" not in st.session_state:
-    st.session_state.inventory = InventoryInputs()
-if "financial" not in st.session_state:
-    st.session_state.financial = FinancialInputs()
-if "workforce" not in st.session_state:
-    st.session_state.workforce = WorkforceInputs()
-if "standard" not in st.session_state:
-    st.session_state.standard = StandardLineInputs()
-if "custom" not in st.session_state:
-    st.session_state.custom = CustomLineInputs()
-if "machine_prices" not in st.session_state:
-    st.session_state.machine_prices = MachinePrices()
-if "import_day" not in st.session_state:
-    st.session_state.import_day = None
-if "last_uploaded_bytes" not in st.session_state:
-    st.session_state.last_uploaded_bytes = None
-
 
 with tabs[0]:
     st.subheader("Import Excel (Export จากเกม)")
+
+    cA, cB = st.columns([1, 3])
+    with cA:
+        if st.button("🔄 Reset (เฉพาะฉัน)"):
+            st.session_state.pop("sid", None)
+            st.rerun()
+    with cB:
+        st.caption(f"Session: {SID[:8]} (แยกค่าต่อคน)")
+
     up = st.file_uploader("อัปโหลดไฟล์ .xlsx ที่ Export จากเกม", type=["xlsx"])
 
     if up is not None:
-        xbytes = up.getvalue()
-        st.session_state.last_uploaded_bytes = xbytes  # ✅ สำคัญ: ทำให้ Dashboard Graph ใช้ได้
+        try:
+            xbytes = up.getvalue()
+            S["last_uploaded_bytes"] = xbytes
 
-        tmp_xl = excel_file_from_bytes(xbytes)
-        std_df = read_sheet(tmp_xl, "Standard")
-        cus_df = read_sheet(tmp_xl, "Custom")
-        fin_df = read_sheet(tmp_xl, "Finance", "Financial")
+            tmp_xl = excel_file_from_bytes(xbytes)
+            std_df = read_sheet(tmp_xl, "Standard")
+            cus_df = read_sheet(tmp_xl, "Custom")
+            fin_df = read_sheet(tmp_xl, "Finance", "Financial")
 
-        # --- compute max_day robust ---
-        all_days = pd.concat(
-            [safe_day_series(std_df), safe_day_series(cus_df), safe_day_series(fin_df)],
-            ignore_index=True,
-        )
-        max_day = int(all_days.max()) if not all_days.empty else 0
+            all_days = pd.concat(
+                [
+                    safe_day_series(std_df, COL["DAY"]),
+                    safe_day_series(cus_df, COL["DAY"]),
+                    safe_day_series(fin_df, COL["DAY"]),
+                ],
+                ignore_index=True,
+            )
+            max_day = int(all_days.max()) if not all_days.empty else 0
 
-        suggested = pick_best_day(std_df, cus_df, fin_df)
-        st.caption(f"ระบบแนะนำเลือก Day = {suggested} (วันล่าสุดที่มีข้อมูลจริง)")
+            suggested = pick_best_day(std_df, cus_df, fin_df)
+            st.caption(f"ระบบแนะนำเลือก Day = {suggested} (วันล่าสุดที่มีข้อมูลจริง)")
 
-        day = st.number_input(
-            "เลือก Day ที่ต้องการวิเคราะห์",
-            min_value=0,
-            max_value=max_day,
-            value=int(suggested),
-            step=1,
-        )
+            day = st.number_input(
+                "เลือก Day ที่ต้องการวิเคราะห์",
+                min_value=0,
+                max_value=max_day,
+                value=int(suggested),
+                step=1,
+            )
 
-        if st.button("✅ Load day นี้เข้าแบบฟอร์ม"):
-            loaded = load_inputs_from_excel(xbytes, day=int(day))
-            st.session_state.inventory = loaded["inventory"]
-            st.session_state.financial = loaded["financial"]
-            st.session_state.workforce = loaded["workforce"]
-            st.session_state.standard = loaded["standard"]
-            st.session_state.custom = loaded["custom"]
-            st.session_state.machine_prices = loaded["machine_prices"]
-            st.session_state.import_day = loaded["day"]
-            st.success(f"โหลดข้อมูลจาก Excel สำเร็จ (Day {loaded['day']}) — ไปแท็บ Dashboard ได้เลย")
+            if st.button("✅ Load day นี้เข้าแบบฟอร์ม"):
+                loaded = load_inputs_from_excel(xbytes, day=int(day))
+                S["inventory"] = loaded["inventory"]
+                S["financial"] = loaded["financial"]
+                S["workforce"] = loaded["workforce"]
+                S["standard"] = loaded["standard"]
+                S["custom"] = loaded["custom"]
+                S["machine_prices"] = loaded["machine_prices"]
+                S["import_day"] = loaded["day"]
+                st.success(f"โหลดข้อมูลจาก Excel สำเร็จ (Day {loaded['day']}) — ไปแท็บ Dashboard ได้เลย")
+
+        except ImportError as e:
+            st.error("อ่านไฟล์ .xlsx ไม่ได้ เพราะขาดไลบรารี openpyxl บนเครื่องที่รันแอป")
+            st.code("ให้เพิ่มใน requirements.txt:\nopenpyxl")
+            st.exception(e)
+        except Exception as e:
+            st.error("Import ล้มเหลว (ดู error ด้านล่าง)")
+            st.exception(e)
 
 
 with tabs[1]:
     st.subheader("Input (ยังแก้ได้หลัง import)")
 
-    inv = st.session_state.inventory
-    fin = st.session_state.financial
-    work = st.session_state.workforce
-    std = st.session_state.standard
-    cus = st.session_state.custom
-    mp = st.session_state.machine_prices
+    inv = S["inventory"]
+    fin = S["financial"]
+    work = S["workforce"]
+    std = S["standard"]
+    cus = S["custom"]
+    mp = S["machine_prices"]
 
     c1, c2, c3 = st.columns(3)
 
@@ -877,16 +922,16 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Dashboard")
 
-    inv = st.session_state.inventory
-    fin = st.session_state.financial
-    work = st.session_state.workforce
-    std = st.session_state.standard
-    cus = st.session_state.custom
-    mp = st.session_state.machine_prices
+    inv = S["inventory"]
+    fin = S["financial"]
+    work = S["workforce"]
+    std = S["standard"]
+    cus = S["custom"]
+    mp = S["machine_prices"]
 
     status, checklist, metrics, caprec = build_status_and_checklist(inv, fin, work, std, cus, mp)
 
-    tag = f"(Imported Day {st.session_state.import_day})" if st.session_state.import_day is not None else ""
+    tag = f"(Imported Day {S['import_day']})" if S["import_day"] is not None else ""
     color = {"OK": "🟢", "WARNING": "🟠", "CRITICAL": "🔴"}[status]
     st.markdown(f"## {color} STATUS: **{status}** {tag}")
 
@@ -898,51 +943,35 @@ with tabs[2]:
     k5.metric("Std Price / Market", f"{num(metrics.get('std_product_price',0.0))} / {num(metrics.get('std_market_price',0.0))}")
 
     st.markdown("### Metrics Table")
-    df = pd.DataFrame([metrics]).T.reset_index()
-    df.columns = ["metric", "value"]
-    st.dataframe(df, use_container_width=True)
+    dfm = pd.DataFrame([metrics]).T.reset_index()
+    dfm.columns = ["metric", "value"]
+    st.dataframe(dfm, use_container_width=True)
 
     st.markdown("### 📈 Trends (จากทั้งไฟล์)")
-
-    if st.session_state.last_uploaded_bytes is None:
+    if S["last_uploaded_bytes"] is None:
         st.info("อัปโหลดไฟล์ในแท็บ Import ก่อน แล้วกราฟจะขึ้นอัตโนมัติ")
     else:
-        std_ts, cus_ts, inv_ts, fin_ts = make_timeseries_from_excel(
-            st.session_state.last_uploaded_bytes
-        )
+        std_ts, cus_ts, inv_ts, fin_ts = make_timeseries_from_excel(S["last_uploaded_bytes"])
 
-        # ==========================
-        # FINANCE
-        # ==========================
         if fin_ts is not None:
             fin_daily = finance_daily_delta(fin_ts)
 
             cols1 = [c for c in ["Cash_On_Hand", "Debt"] if c in fin_daily.columns]
             if cols1:
-                st.subheader("💰 Finance — Cash & Debt")
+                st.markdown("#### 💵 Finance — Cash & Debt")
                 st.line_chart(fin_daily.set_index("Day")[cols1], height=220)
 
-            cols2 = [
-                c for c in
-                ["Sales_per_Day", "Costs_Proxy_per_Day", "Profit_Proxy_per_Day"]
-                if c in fin_daily.columns
-            ]
+            cols2 = [c for c in ["Sales_per_Day", "Costs_Proxy_per_Day", "Profit_Proxy_per_Day"] if c in fin_daily.columns]
             if cols2:
-                st.subheader("📊 Finance — Daily Profit Proxy")
+                st.markdown("#### 📊 Finance — Sales / Cost / Profit (Proxy) per Day")
                 st.line_chart(fin_daily.set_index("Day")[cols2], height=220)
 
-        # ==========================
-        # INVENTORY
-        # ==========================
         if inv_ts is not None:
             inv_col = pick_col(inv_ts, COL["INV_LEVEL"])
             if inv_col:
-                st.subheader("📦 Inventory Level Over Time")
+                st.markdown("#### 📦 Inventory — Parts Level")
                 st.line_chart(inv_ts.set_index("Day")[[inv_col]], height=200)
 
-        # ==========================
-        # CUSTOM LINE
-        # ==========================
         if cus_ts is not None:
             dcol = pick_col(cus_ts, COL["CUS_DEMAND"])
             delcol = pick_col(cus_ts, COL["CUS_DELIV"])
@@ -952,21 +981,18 @@ with tabs[2]:
 
             cols = [c for c in [dcol, delcol] if c]
             if cols:
-                st.subheader("🧩 Custom Line — Demand vs Deliveries")
+                st.markdown("#### 🧩 Custom — Demand vs Deliveries")
                 st.line_chart(cus_ts.set_index("Day")[cols], height=220)
 
             cols = [c for c in [q2_1, q2_2] if c]
             if cols:
-                st.subheader("🧵 Custom Line — Queue 2 (First vs Second Pass)")
+                st.markdown("#### 🧩 Custom — Q2 First Pass vs Second Pass")
                 st.line_chart(cus_ts.set_index("Day")[cols], height=220)
 
             if ltcol:
-                st.subheader("⏱️ Custom Line — Average Lead Time")
+                st.markdown("#### 🧩 Custom — Average Lead Time")
                 st.line_chart(cus_ts.set_index("Day")[[ltcol]], height=200)
 
-        # ==========================
-        # STANDARD LINE
-        # ==========================
         if std_ts is not None:
             s_acc = pick_col(std_ts, COL["STD_ACCEPT"])
             s_del = pick_col(std_ts, COL["STD_DELIV"])
@@ -975,24 +1001,24 @@ with tabs[2]:
 
             cols = [c for c in [s_acc, s_del] if c]
             if cols:
-                st.subheader("🏭 Standard Line — Accepted vs Delivered Orders")
+                st.markdown("#### 🧱 Standard — Accepted vs Deliveries")
                 st.line_chart(std_ts.set_index("Day")[cols], height=220)
 
             cols = [c for c in [s_pp, s_mp] if c]
             if cols:
-                st.subheader("💵 Standard Line — Product Price vs Market Price")
+                st.markdown("#### 🧱 Standard — Product Price vs Market Price")
                 st.line_chart(std_ts.set_index("Day")[cols], height=200)
 
 
 with tabs[3]:
     st.subheader("Checklist + Recommendations")
 
-    inv = st.session_state.inventory
-    fin = st.session_state.financial
-    work = st.session_state.workforce
-    std = st.session_state.standard
-    cus = st.session_state.custom
-    mp = st.session_state.machine_prices
+    inv = S["inventory"]
+    fin = S["financial"]
+    work = S["workforce"]
+    std = S["standard"]
+    cus = S["custom"]
+    mp = S["machine_prices"]
 
     status, checklist, metrics, caprec = build_status_and_checklist(inv, fin, work, std, cus, mp)
 
