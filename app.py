@@ -1,17 +1,23 @@
 # ============================================================
 # Factory Status Analyzer (Game Excel Export) — PRO + FULL ✅
-# ✅ Keeps your ORIGINAL snapshot analysis (ครบ/แน่น/เหมือนตอนแรก)
+# ✅ Keeps ORIGINAL snapshot analysis (ครบ/แน่น)
 # ✅ Robust import (alias columns, pick best day that has activity)
 # ✅ Per-user session isolation (เพื่อนเข้าลิงก์เดียวกันไม่เห็นค่ากัน)
 # ✅ Snapshot checklist + recommended settings (ROP/ROQ, S2 alloc, hire, machines)
-# ✅ Full-file trends (optional, ไม่ทำให้ logic เดิมเพี้ยน)
-# ✅ Pricing suggest (optional) + capacity-aware warning
-# ✅ Why/What-if (optional): อธิบายเหตุผล + คาดการณ์ผลแบบ conservative
+# ✅ Full-file trends (cash/debt/profit proxy, queues, capacity)
+# ✅ Pricing: Suggest Std Product Price (regression + fallback) + capacity-aware warning
+# ✅ NEW: PriceDiff (Product - Market) impact on Deliveries
+#     - correlation + regression
+#     - optional lag test (Pdiff today -> deliveries t+lag)
+# ✅ Why + conservative What-if + Loan helper
 #
-# Requirements (Streamlit Cloud):
+# Requirements:
+#   streamlit
 #   pandas
 #   openpyxl
-#   streamlit
+#
+# Run:
+#   streamlit run app.py
 # ============================================================
 
 import io
@@ -324,7 +330,7 @@ S = st.session_state.sessions[SID]
 # Import utilities
 # ============================================================
 def pick_best_day(std_df, cus_df, fin_df) -> int:
-    """Pick latest day that has real activity (เหมือนแนวเดิมของคุณ)."""
+    """Pick latest day that has real activity."""
     all_days = pd.concat(
         [
             safe_day_series(std_df, COL["DAY"]),
@@ -340,7 +346,6 @@ def pick_best_day(std_df, cus_df, fin_df) -> int:
 
     def score_day(d: int) -> float:
         s = 0.0
-
         if cus_df is not None:
             dcol = pick_col(cus_df, COL["DAY"])
             if dcol:
@@ -361,7 +366,6 @@ def pick_best_day(std_df, cus_df, fin_df) -> int:
                     s += abs(getv(row, std_df, COL["STD_DELIV"]))
                     s += abs(getv(row, std_df, COL["STD_MP_OUT"]))
                     s += abs(getv(row, std_df, COL["STD_EWL"]))
-
         if fin_df is not None:
             dcol = pick_col(fin_df, COL["DAY"])
             if dcol:
@@ -369,7 +373,6 @@ def pick_best_day(std_df, cus_df, fin_df) -> int:
                 if not r.empty:
                     row = r.iloc[0]
                     s += abs(getv(row, fin_df, COL["CASH"]))
-
         return s
 
     for d in range(max_day, -1, -1):
@@ -437,7 +440,7 @@ def load_inputs_from_excel(xbytes: bytes, day: Optional[int] = None) -> Dict[str
     wf.salary_rookie_per_day = CHEAT_DEFAULTS["salary_rookie_per_day"]
     wf.salary_expert_per_day = CHEAT_DEFAULTS["salary_expert_per_day"]
 
-    # Standard (FULL like your original)
+    # Standard (FULL)
     if std_r is not None and std_df is not None:
         std.accepted_orders = getv(std_r, std_df, COL["STD_ACCEPT"], 0.0)
         std.accumulated_orders = getv(std_r, std_df, COL["STD_ACCUM"], 0.0)
@@ -461,7 +464,7 @@ def load_inputs_from_excel(xbytes: bytes, day: Optional[int] = None) -> Dict[str
 
     std.parts_per_unit = CHEAT_DEFAULTS["std_parts_per_unit"]
 
-    # Custom (FULL like your original)
+    # Custom (FULL)
     if cus_r is not None and cus_df is not None:
         cus.accepted_orders = getv(cus_r, cus_df, COL["CUS_ACCEPT"], 0.0)
         cus.accumulated_orders = getv(cus_r, cus_df, COL["CUS_ACCUM"], 0.0)
@@ -498,7 +501,7 @@ def load_inputs_from_excel(xbytes: bytes, day: Optional[int] = None) -> Dict[str
 
 
 # ============================================================
-# Core snapshot recommendations (เหมือนเดิม)
+# Core snapshot recommendations
 # ============================================================
 def recommend_reorder_policy(inv: InventoryInputs, std: StandardLineInputs, cus: CustomLineInputs) -> Dict[str, float]:
     std_d = std_daily_demand(std)
@@ -506,6 +509,7 @@ def recommend_reorder_policy(inv: InventoryInputs, std: StandardLineInputs, cus:
     cus_parts = cus.daily_demand * cus.parts_per_unit
     D = std_parts + cus_parts  # parts/day
 
+    # EOQ with holding cost ~1 per part/day (cheat)
     h = 1.0
     Sfee = inv.order_fee
     rop = D * inv.lead_time_days
@@ -547,6 +551,7 @@ def diagnose_standard_flow(std: StandardLineInputs) -> Dict[str, float]:
     return {"std_demand_gap": demand_gap, "std_wip_proxy": wip_proxy, "std_backlog_proxy": backlog_proxy}
 
 def pick_custom_bottleneck(cus: CustomLineInputs) -> str:
+    # heuristic: Q2 second-pass explosion implies S2 constraint
     if cus.queue2_level_second_pass > cus.queue2_level_first_pass * 1.2 and cus.queue2_level_second_pass > 5:
         return "S2"
     s1, s2, s3 = cus.station1_output, cus.station2_output_first_pass, cus.station3_output
@@ -586,6 +591,7 @@ def recommend_capacity_and_hiring(
             "capex_estimate": 0.0,
         }
 
+    # machine add suggestion (very conservative)
     if bottleneck == "S2":
         add_s2 = ceil_int(safe_div(gap, max(1e-9, s2_per_machine), default=0.0)) if s2_per_machine > 0 else 1
     elif bottleneck == "S3":
@@ -594,7 +600,6 @@ def recommend_capacity_and_hiring(
         add_s1 = 0
 
     rookie_prod = wf.rookie_productivity_vs_expert if wf.rookie_productivity_vs_expert > 0 else 0.40
-
     base = max(1.0, {"S1": s1_total, "S2": s2_total, "S3": s3_total}.get(bottleneck, s2_total))
     expert_equiv_needed = gap / base
     hire_rookies = ceil_int(expert_equiv_needed / rookie_prod)
@@ -668,7 +673,7 @@ def build_status_and_checklist(
     if metrics["std_daily_demand"] > 0 and std_diag["std_demand_gap"] > 0:
         severity += 1
         if std.effective_work_load_pct >= 95 or std.manual_processing_output > 0:
-            reasons.append("Standard ส่งมอบไม่ทัน + Workload สูง → demand ถูกจำกัดด้วย capacity (price-fit อาจหลอกได้)")
+            reasons.append("Standard ส่งมอบไม่ทัน + Workload สูง → demand ที่เห็นอาจติด capacity (price-fit อาจหลอกได้)")
         checklist.append({
             "area": "Standard Line",
             "finding": f"Standard ส่งมอบไม่ทัน demand (gap {num(std_diag['std_demand_gap'])}/day)",
@@ -718,7 +723,7 @@ def build_status_and_checklist(
 
 
 # ============================================================
-# Full-file timeseries (optional) + Profit proxy
+# Full-file timeseries + Profit proxy
 # ============================================================
 def make_timeseries_from_excel(xbytes: bytes):
     xl = excel_file_from_bytes(xbytes)
@@ -773,7 +778,7 @@ def finance_daily_delta(fin_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ============================================================
-# Pricing suggestion (optional) — conservative + capacity-aware warning
+# Pricing suggestion — conservative + capacity-aware warning
 # ============================================================
 def build_standard_price_dataset(std_ts: pd.DataFrame) -> pd.DataFrame:
     price_c = pick_col(std_ts, COL["STD_PRICE"])
@@ -793,7 +798,7 @@ def build_standard_price_dataset(std_ts: pd.DataFrame) -> pd.DataFrame:
     df["EWL"] = as_numeric_series(std_ts, ewl_c)
     df["MP_Out"] = as_numeric_series(std_ts, mp_out_c)
 
-    # DemandProxy (ดีที่สุดคือ accepted ต่อวัน ถ้ามี)
+    # DemandProxy
     df["DemandProxy"] = df["Accepted"].clip(lower=0.0)
 
     # Backlog proxy
@@ -844,7 +849,8 @@ def suggest_standard_price(std_price_df: pd.DataFrame) -> Dict[str, float]:
     fit = fit_linear_demand(std_price_df["Price"], std_price_df["DemandProxy"])
     if fit is not None:
         a, b, r2 = fit
-        if b < 0 and r2 >= -0.5:
+        # expect b < 0; still allow weak signal
+        if b < 0:
             p_star = -a / (2.0 * b)
             if last_market > 0:
                 lo, hi = 0.8 * last_market, 1.2 * last_market
@@ -856,7 +862,7 @@ def suggest_standard_price(std_price_df: pd.DataFrame) -> Dict[str, float]:
             p_suggest = float(clamp(p_star, lo, hi))
             return {
                 "suggested_price": p_suggest,
-                "method": 1.0,
+                "method": 1.0,  # regression
                 "r2": float(r2),
                 "last_price": last_price,
                 "last_market": last_market,
@@ -881,7 +887,7 @@ def suggest_standard_price(std_price_df: pd.DataFrame) -> Dict[str, float]:
     p_suggest = float(clamp(base * (1.0 + adj), 0.8 * base, 1.2 * base))
     return {
         "suggested_price": p_suggest,
-        "method": 2.0,
+        "method": 2.0,  # fallback
         "r2": 0.0,
         "last_price": last_price,
         "last_market": last_market,
@@ -898,24 +904,22 @@ def conservative_what_if_std(
     current_deliveries: float,
 ) -> Dict[str, float]:
     """
-    What-if แบบ conservative:
-    - ถ้ามี slope (b) ใช้ demand_hat = a + b*P
-    - จำกัดยอดขายด้วย capacity (ใช้ deliveries ปัจจุบันเป็น proxy)
-    - แสดง revenue delta แบบง่าย (ไม่เดารายจ่ายทั้งหมด)
+    Conservative what-if:
+    - If regression available: demand_hat = a + b*P
+    - Clamp sales by capacity proxy (deliveries now)
+    - Report revenue delta (proxy)
     """
     a = float(fit_info.get("a", 0.0))
     b = float(fit_info.get("b", 0.0))
     method = float(fit_info.get("method", 0.0))
 
-    # baseline
     d0 = max(0.0, float(current_demand_proxy))
     cap = max(0.0, float(current_deliveries))
 
-    # demand prediction
     if method == 1.0 and b != 0.0:
         d1 = max(0.0, a + b * float(suggested_price))
     else:
-        # heuristic elasticity: +10% price => -5% demand (ปรับได้ทีหลัง)
+        # heuristic elasticity: +10% price => -5% demand
         if current_price <= 0:
             d1 = d0
         else:
@@ -941,17 +945,137 @@ def conservative_what_if_std(
 
 
 # ============================================================
+# NEW: PriceDiff (Product - Market) impact on Deliveries
+# ============================================================
+def analyze_price_diff_vs_deliveries(std_ts: pd.DataFrame, lag_days: int = 0) -> Dict[str, object]:
+    """
+    Analyze how (ProductPrice - MarketPrice) relates to Deliveries.
+    Optionally apply lag: PriceDiff at day t compared to Deliveries at day t+lag.
+
+    Outputs:
+      - correlation between PriceDiff(t) and Deliveries(t+lag)
+      - OLS regression: Deliveries(t+lag) = a + b*PriceDiff(t)
+      - binned table by PriceDiff for easy reading
+      - capacity warning if EWL high or Deliveries < Accepted (no lag)
+    """
+    if std_ts is None or std_ts.empty:
+        return {"ok": False, "reason": "std_ts empty"}
+
+    price_c = pick_col(std_ts, COL["STD_PRICE"])
+    mkt_c = pick_col(std_ts, COL["STD_MKT"])
+    del_c = pick_col(std_ts, COL["STD_DELIV"])
+    acc_c = pick_col(std_ts, COL["STD_ACCEPT"])
+    ewl_c = pick_col(std_ts, COL["STD_EWL"])
+
+    df = pd.DataFrame({"Day": std_ts["Day"]})
+    df["ProductPrice"] = as_numeric_series(std_ts, price_c)
+    df["MarketPrice"] = as_numeric_series(std_ts, mkt_c)
+    df["Deliveries"] = as_numeric_series(std_ts, del_c)
+    df["Accepted"] = as_numeric_series(std_ts, acc_c)
+    df["EWL"] = as_numeric_series(std_ts, ewl_c)
+
+    df = df[(df["ProductPrice"] > 0) & (df["MarketPrice"] > 0)].copy()
+    if df.empty:
+        return {"ok": False, "reason": "no usable price rows"}
+
+    df["PriceDiff"] = df["ProductPrice"] - df["MarketPrice"]
+    df["FillGap"] = (df["Accepted"] - df["Deliveries"]).clip(lower=0.0)
+
+    # apply lag by shifting deliveries backward so that Y aligns with X at t
+    # want: X(t) vs Y(t+lag)  => create Y_lag = Deliveries shifted by -lag (so index t holds deliveries at t+lag)
+    if lag_days and lag_days > 0:
+        df = df.sort_values("Day").reset_index(drop=True)
+        df["Deliveries_Lag"] = df["Deliveries"].shift(-int(lag_days))
+        df = df.dropna(subset=["Deliveries_Lag"]).copy()
+        y_series = df["Deliveries_Lag"]
+    else:
+        y_series = df["Deliveries"]
+
+    if df.empty or len(df) < 8:
+        return {"ok": False, "reason": "not enough rows after lag/filter"}
+
+    # Correlation
+    corr = float(df["PriceDiff"].corr(y_series)) if df["PriceDiff"].nunique() > 1 else 0.0
+
+    # OLS regression: y = a + b*x
+    x = df["PriceDiff"].astype(float).values
+    y = y_series.astype(float).values
+    n = len(df)
+
+    slope = 0.0
+    intercept = float(y.mean()) if n else 0.0
+    r2 = 0.0
+    if n >= 8 and float(pd.Series(x).nunique()) >= 3:
+        xm = x.mean()
+        ym = y.mean()
+        varx = ((x - xm) ** 2).sum()
+        if varx > 1e-9:
+            cov = ((x - xm) * (y - ym)).sum()
+            slope = cov / varx
+            intercept = ym - slope * xm
+
+            yhat = intercept + slope * x
+            ss_res = ((y - yhat) ** 2).sum()
+            ss_tot = ((y - ym) ** 2).sum() + 1e-9
+            r2 = 1.0 - ss_res / ss_tot
+
+    # Bin analysis
+    binned = pd.DataFrame()
+    try:
+        if df["PriceDiff"].nunique() >= 6:
+            df["DiffBin"] = pd.qcut(df["PriceDiff"], q=6, duplicates="drop")
+        else:
+            width = max(1.0, float(df["PriceDiff"].abs().max() / 3.0))
+            edges = [-3*width, -2*width, -1*width, 0, 1*width, 2*width, 3*width]
+            df["DiffBin"] = pd.cut(df["PriceDiff"], bins=edges, include_lowest=True)
+
+        tmp_y = "Deliveries_Lag" if (lag_days and lag_days > 0) else "Deliveries"
+        binned = (
+            df.groupby("DiffBin", dropna=True)
+              .agg(
+                  days=("Day", "count"),
+                  avg_diff=("PriceDiff", "mean"),
+                  avg_deliveries=(tmp_y, "mean"),
+                  avg_fillgap=("FillGap", "mean"),
+                  avg_ewl=("EWL", "mean"),
+              )
+              .reset_index()
+        )
+    except Exception:
+        binned = pd.DataFrame()
+
+    # capacity warning (only meaningful with no lag)
+    cap_warning = False
+    if lag_days == 0:
+        if df["EWL"].mean() >= 95:
+            cap_warning = True
+        if (df["Accepted"].mean() > 0) and ((df["Deliveries"].mean() / (df["Accepted"].mean() + 1e-9)) < 0.98):
+            cap_warning = True
+
+    return {
+        "ok": True,
+        "lag_days": int(lag_days),
+        "n_days": int(n),
+        "corr_priceDiff_deliveries": float(corr),
+        "reg_intercept": float(intercept),
+        "reg_slope_deliveries_per_$diff": float(slope),
+        "reg_r2": float(r2),
+        "capacity_warning": bool(cap_warning),
+        "table_binned": binned,
+    }
+
+
+# ============================================================
 # UI
 # ============================================================
 st.set_page_config(page_title="Factory Status Analyzer", layout="wide")
 
-# --- Header (clean/professional)
-top = st.container()
-with top:
+# Header
+with st.container():
     c1, c2 = st.columns([2, 1])
     with c1:
         st.title("🏭 Factory Status Analyzer")
-        st.caption("Snapshot-first (เหมือนสคริปต์แรก) + เพิ่ม Trends/Pricing/What-if แบบไม่ทำให้ logic เดิมเพี้ยน")
+        st.caption("Snapshot-first (เหมือนสคริปต์แรก) + Trends/Pricing/What-if + PriceDiff→Deliveries")
     with c2:
         st.markdown("#### Session")
         st.code(SID[:8])
@@ -964,7 +1088,7 @@ tabs = st.tabs([
     "1) Input (Snapshot override)",
     "2) Dashboard (Snapshot)",
     "3) Trends (Full-file)",
-    "4) Pricing (Full-file)",
+    "4) Pricing + PriceDiff",
     "5) Why + What-if + Loan",
 ])
 
@@ -973,7 +1097,7 @@ tabs = st.tabs([
 # --------------------
 with tabs[0]:
     st.subheader("Import Excel (Export จากเกม)")
-    st.write("อัปโหลดไฟล์ .xlsx จากเกม แล้วเลือก Day เพื่อโหลดเข้า Snapshot Analyzer (ครบเหมือนเดิม)")
+    st.write("อัปโหลดไฟล์ .xlsx จากเกม แล้วเลือก Day เพื่อโหลดเข้า Snapshot Analyzer")
 
     up = st.file_uploader("Upload .xlsx", type=["xlsx"])
 
@@ -1026,7 +1150,7 @@ with tabs[0]:
             st.exception(e)
 
 # --------------------
-# Tab 1: Snapshot input override (ครบเหมือนเดิม)
+# Tab 1: Snapshot input override
 # --------------------
 with tabs[1]:
     st.subheader("Input (Snapshot override)")
@@ -1126,7 +1250,7 @@ with tabs[1]:
         mp.station3_buy = st.number_input("S3 buy", value=float(mp.station3_buy), step=1000.0)
 
 # --------------------
-# Tab 2: Dashboard snapshot (เหมือนตอนแรก + สวยขึ้น)
+# Tab 2: Dashboard snapshot
 # --------------------
 with tabs[2]:
     st.subheader("Dashboard (Snapshot)")
@@ -1257,10 +1381,10 @@ with tabs[3]:
                 st.line_chart(std_ts.set_index("Day")[cols], height=220)
 
 # --------------------
-# Tab 4: Pricing (Full-file)
+# Tab 4: Pricing + PriceDiff
 # --------------------
 with tabs[4]:
-    st.subheader("Pricing (Full-file) — Suggest Standard Product Price")
+    st.subheader("Pricing (Full-file) — Suggest Standard Product Price + PriceDiff→Deliveries")
     if S["last_uploaded_bytes"] is None:
         st.info("อัปโหลดไฟล์ในแท็บ Import ก่อน")
     else:
@@ -1314,7 +1438,7 @@ with tabs[4]:
 
                 st.markdown("### 📈 Price vs DemandProxy (sorted-by-price view)")
                 sc = dfR.sort_values("Price")[["Price", "DemandProxy"]].reset_index(drop=True)
-                st.caption("หมายเหตุ: Streamlit ไม่มี scatter native → ใช้เส้นเรียงตามราคาเพื่อดูแนวโน้ม demand")
+                st.caption("หมายเหตุ: ใช้เส้นเรียงตามราคาเพื่อดูแนวโน้ม demand (แทน scatter)")
                 st.line_chart(sc.set_index("Price")[["DemandProxy"]], height=220)
 
                 st.markdown("### 🧱 Backlog & Fill Rate Over Time")
@@ -1333,8 +1457,57 @@ with tabs[4]:
                 with st.expander("Raw suggestion JSON"):
                     st.json(sugg)
 
+            # ------------------------------
+            # NEW: PriceDiff (Product - Market) vs Deliveries
+            # ------------------------------
+            st.markdown("---")
+            st.subheader("📌 Effect of (Product − Market) on Deliveries")
+
+            lag = st.select_slider(
+                "ลองทดสอบ Lag (PriceDiff วันนี้ → Deliveries อีกกี่วันถัดไป)",
+                options=[0, 1, 2, 3],
+                value=0,
+            )
+            eff = analyze_price_diff_vs_deliveries(std_ts, lag_days=int(lag))
+
+            if not eff.get("ok"):
+                st.info(f"วิเคราะห์ไม่ได้: {eff.get('reason')}")
+            else:
+                st.caption("ดูว่าตั้งราคาแพง/ถูกกว่าตลาด (PriceDiff) “สัมพันธ์” กับ Deliveries แค่ไหน (ไม่การันตีเหตุ-ผล)")
+
+                e1, e2, e3, e4 = st.columns(4)
+                e1.metric("Days used", str(int(eff.get("n_days", 0))))
+                e2.metric("Corr(PriceDiff, Deliveries)", num(eff.get("corr_priceDiff_deliveries", 0.0)))
+                e3.metric("Slope (Deliveries per +$1 diff)", num(eff.get("reg_slope_deliveries_per_$diff", 0.0)))
+                e4.metric("R²", num(eff.get("reg_r2", 0.0)))
+
+                if eff.get("capacity_warning", False):
+                    st.warning("⚠️ Deliveries อาจติด Capacity/Backlog → ผลของราคาอาจไม่ชัด (แม้ราคาเปลี่ยน demand จริง)")
+
+                st.markdown("#### อ่านเร็ว ๆ")
+                slope = float(eff.get("reg_slope_deliveries_per_$diff", 0.0))
+                if slope < 0:
+                    st.write("- แนวโน้ม: ตั้งแพงกว่าตลาดมากขึ้น → Deliveries มีโอกาสลดลง")
+                elif slope > 0:
+                    st.write("- แนวโน้ม: ตั้งแพงกว่าตลาดมากขึ้น → Deliveries มีโอกาสเพิ่มขึ้น (ผิดปกติ/อาจสะท้อน demand ถูกจำกัด/กลยุทธ์อื่น)")
+                else:
+                    st.write("- แนวโน้ม: ความต่างราคา ↔ Deliveries ไม่ชัดเจน")
+
+                binned = eff.get("table_binned", pd.DataFrame())
+                if binned is not None and not binned.empty:
+                    st.markdown("#### Bin view: เฉลี่ย Deliveries ตามช่วง PriceDiff")
+                    st.dataframe(binned, use_container_width=True)
+                    bp = binned.copy().sort_values("avg_diff")
+                    bp = bp.set_index("avg_diff")[["avg_deliveries"]]
+                    st.line_chart(bp, height=220)
+                else:
+                    st.info("ข้อมูล PriceDiff กระจุกตัวมาก/น้อยเกินไป → ทำ bin ไม่ได้ (แต่ยังมี corr/regression ด้านบน)")
+
+                with st.expander("Raw effect JSON"):
+                    st.json(eff)
+
 # --------------------
-# Tab 5: Why + What-if + Loan (ยัง conservative ไม่เดาเกมเกินข้อมูล)
+# Tab 5: Why + What-if + Loan
 # --------------------
 with tabs[5]:
     st.subheader("Why + What-if + Loan (Conservative)")
@@ -1395,12 +1568,11 @@ with tabs[5]:
         st.json(wi)
 
     st.markdown("### 🏦 Loan helper (Decision support)")
-    st.caption("เกมกู้เงินได้ → เราเทียบ ‘กำไรเพิ่ม/วัน’ กับ ‘ต้นทุนเงินกู้/วัน’ แบบง่าย ๆ")
+    st.caption("เกมกู้เงินได้ → เทียบ ‘กำไรเพิ่ม/วัน’ กับ ‘ต้นทุนเงินกู้/วัน’ แบบง่าย ๆ")
 
     loan_amount = st.number_input("Loan amount (ทดลองใส่)", value=0.0, step=1000.0)
     expected_profit_increase_per_day = st.number_input("Expected profit increase per day (คุณประเมินเอง)", value=0.0, step=100.0)
 
-    # cost of loan per day (approx): interest + (commission spread across N days)
     apr = float(fin.normal_debt_apr)
     commission = float(fin.loan_commission_rate)
     commission_days = st.number_input("Spread commission over days", value=30, step=5)
@@ -1424,6 +1596,4 @@ with tabs[5]:
     st.write("- ถ้าจะกู้: ให้กู้เพื่อแก้คอขวดที่ให้ **กำไร/วันเพิ่มจริง** (ไม่ใช่ซื้อทุกอย่าง)")
     st.write("- ถ้า Standard EWL สูงมาก: price-fit อาจไม่ช่วยยอดขาย เพราะขายติด capacity → ต้องแก้คอขวดก่อน")
 
-
-# Footer
 st.caption("")
