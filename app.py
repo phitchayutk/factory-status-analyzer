@@ -1426,4 +1426,4 @@ with tabs[5]:
 
 
 # Footer
-st.caption("Tip: ถ้าบางคอลัมน์ใน Excel ไม่ match alias → ส่งชื่อคอลัมน์จริงมา เดี๋ยวผมเพิ่ม alias ให้ทันที")
+st.caption("")
